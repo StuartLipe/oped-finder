@@ -28,7 +28,7 @@ const FRAME = 4096
 const HOP = 5512 // 0.5 s
 const BANDS = 16
 const MIN_SIM = 0.72
-const MATCH_FLOOR = 0.8
+const MATCH_FLOOR = 0.7
 const MIN_MATCH = 0.85
 const MIN_RUN = 30 // 15 s — menor trecho aceito como OP/ED
 const MIN_VOTES = 2
@@ -221,15 +221,25 @@ function dot(a, b) {
  * Acha o melhor trecho comum entre duas impressões digitais.
  *
  * Em vez de janela fixa, usa Kadane sobre (similaridade - piso): o resultado é
- * o maior trecho contíguo que se mantém acima do piso, o que lida bem com OP
- * de 90 s e ED de 45 s sem diluir a média com o fundo diferente dos episódios.
+ * o maior trecho contíguo que se mantém acima do piso.
+ *
+ * `prefer`: 'start' | 'end' | null
+ *   'start' (OP): restringe a busca a trechos que começam nos primeiros
+ *     maxStartSec segundos (padrão 60s). Assim a abertura real vence sobre
+ *     silêncio ou trechos comuns no meio/fim do episódio.
+ *   'end' (ED): restringe a busca a trechos que terminam nos últimos
+ *     maxEndSec segundos (padrão 60s) a partir do fim da região analisada.
  *
  * Retorna { i, j, length, score } em frames, ou null.
  */
-function bestCommonSegment(a, b) {
+function bestCommonSegment(a, b, prefer = null, maxStartSec = 60, maxEndSec = 60) {
   const n = a.length
   const m = b.length
   if (n < MIN_RUN || m < MIN_RUN) return null
+
+  // Limites em frames (0.5s por frame).
+  const maxStartFrame = prefer === 'start' ? Math.floor(maxStartSec * SR / HOP) : n
+  const minEndFrame = prefer === 'end' ? Math.ceil(n - maxEndSec * SR / HOP) : 0
 
   let best = null
   for (let d = -(n - MIN_RUN); d <= m - MIN_RUN; d++) {
@@ -259,25 +269,46 @@ function bestCommonSegment(a, b) {
 
     const length = bestEnd - bestStart + 1
     if (length < MIN_RUN) continue
-    const score = (bestSum + MATCH_FLOOR * length) / length
+
+    // Restrição posicional: para OP, o trecho deve começar cedo;
+    // para ED, deve terminar tarde.
+    if (prefer === 'start' && bestStart > maxStartFrame) continue
+    if (prefer === 'end' && (bestEnd + 1) < minEndFrame) continue
+
+    let score = (bestSum + MATCH_FLOOR * length) / length
 
     if (!best) {
       best = { i: bestStart, j: bestStart + d, length, score }
       continue
     }
-    // Prefere o trecho mais longo quando a qualidade é praticamente a mesma.
-    const better = score > best.score + 0.02 || (score >= best.score - 0.02 && length > best.length)
+    // Empate de score (diferença < 0.02): desempata pela posição.
+    const tie = score >= best.score - 0.02 && score <= best.score + 0.02
+    let better = false
+    if (tie) {
+      if (prefer === 'start') {
+        better = bestStart < best.i
+      } else if (prefer === 'end') {
+        better = (bestStart + length) > (best.i + best.length)
+      } else {
+        better = length > best.length
+      }
+    } else {
+      better = score > best.score + 0.02 || (score >= best.score - 0.02 && length > best.length)
+    }
     if (better) best = { i: bestStart, j: bestStart + d, length, score }
   }
 
   if (!best || best.score < MIN_MATCH) return null
 
   // Estende para os lados enquanto o trecho continuar parecido.
+  // Usa um limiar mais alto que MIN_SIM para não "pular" para silêncio
+  // ou trechos próximos que não fazem parte da OP/ED real.
+  const EXT_SIM = 0.8
   const simAt = (i, j) => (i >= 0 && j >= 0 && i < n && j < m ? dot(a[i], b[j]) : -1)
   let left = 0
   let misses = 0
   while (best.i - left - 1 >= 0 && best.j - left - 1 >= 0) {
-    if (simAt(best.i - left - 1, best.j - left - 1) >= MIN_SIM) {
+    if (simAt(best.i - left - 1, best.j - left - 1) >= EXT_SIM) {
       misses = 0
       left++
     } else if (++misses > 2) break
@@ -288,7 +319,7 @@ function bestCommonSegment(a, b) {
   const endI = best.i + best.length
   const endJ = best.j + best.length
   while (endI + right < n && endJ + right < m) {
-    if (simAt(endI + right, endJ + right) >= MIN_SIM) {
+    if (simAt(endI + right, endJ + right) >= EXT_SIM) {
       misses = 0
       right++
     } else if (++misses > 2) break
@@ -360,7 +391,7 @@ async function analyzeRegion(files, region, onProgress) {
     const b = perFile[index + 1]
     if (!a.frames || !b.frames) continue
     onProgress?.({ phase: 'match', index, total: perFile.length, kind: region.kind })
-    const hit = bestCommonSegment(a.frames, b.frames)
+    const hit = bestCommonSegment(a.frames, b.frames, region.kind === 'op' ? 'start' : region.kind === 'ed' ? 'end' : null)
     if (!hit) continue
     const segment = {
       a: { start: a.offset + hit.startA, end: a.offset + hit.endA },
