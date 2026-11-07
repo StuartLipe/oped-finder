@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Player, { formatTime, type PlayerSettings } from './Player'
 import BatchPanel from './BatchPanel'
+import HistoryPanel from './HistoryPanel'
 import type { AnalyzeProgress, Library, Marker, Series } from './types'
 
 const SETTINGS_KEY = 'oped-finder:settings'
@@ -9,9 +10,7 @@ function loadSettings(): PlayerSettings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY)
     if (raw) return { autoSkipOp: false, autoSkipEd: false, autoAdvance: true, ...JSON.parse(raw) }
-  } catch {
-    /* ignora */
-  }
+  } catch { /* ignora */ }
   return { autoSkipOp: false, autoSkipEd: false, autoAdvance: true }
 }
 
@@ -25,6 +24,10 @@ export default function App() {
   const [busy, setBusy] = useState<string | null>(null)
   const [toast, setToast] = useState<{ type: 'info' | 'error'; text: string } | null>(null)
   const [batchOpen, setBatchOpen] = useState(false)
+  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; text: string } | null>(null)
+  const [batchLogs, setBatchLogs] = useState<string[]>([])
+  const [batchVisible, setBatchVisible] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(false)
   const saveTimer = useRef<number | null>(null)
 
   useEffect(() => {
@@ -59,6 +62,20 @@ export default function App() {
   useEffect(() => {
     const unsubscribe = window.oped.onAnalyzeProgress((payload) => setProgress(payload))
     return unsubscribe
+  }, [])
+
+  // progresso do batch em tempo real
+  useEffect(() => {
+    const unsubLog = window.oped.onBatchLog((text) => {
+      const m = text.match(/^PROGRESS:(\d+)\/(\d+)/)
+      if (m) {
+        setBatchProgress({ current: +m[1], total: +m[2], text: text.replace(/^PROGRESS:\d+\/\d+\s*/, '') })
+        setBatchVisible(true)
+      } else {
+        setBatchLogs((prev) => [...prev, text])
+      }
+    })
+    return unsubLog
   }, [])
 
   useEffect(() => {
@@ -222,6 +239,10 @@ export default function App() {
           Batch: analisar catálogo
         </button>
 
+        <button className="primary" onClick={() => setHistoryOpen(true)} disabled={busy !== null}>
+          Histórico de OP/ED
+        </button>
+
         <ul className="series-list">
           {library.series.map((item) => {
             const analyzed = item.episodes.filter((episodeItem) => episodeItem.op).length
@@ -342,6 +363,28 @@ export default function App() {
 
       {batchOpen && (
         <BatchPanel onClose={() => setBatchOpen(false)} />
+      )}
+
+      {historyOpen && (
+        <HistoryPanel library={library} onClose={() => setHistoryOpen(false)} />
+      )}
+
+      {batchProgress && batchVisible && (
+        <section className="batch-progress visible">
+          <div className="batch-progress-header">
+            <h3>Batch em andamento</h3>
+            <button className="batch-progress-close" onClick={() => setBatchVisible(false)}>×</button>
+          </div>
+          <div className="batch-progress-bar">
+            <div className="batch-progress-fill" style={{ width: `${(batchProgress.current / Math.max(1, batchProgress.total)) * 100}%` }} />
+          </div>
+          <div className="batch-progress-text">
+            {batchProgress.current} / {batchProgress.total} · {batchProgress.text}
+          </div>
+          <div className="batch-progress-log">
+            {batchLogs.slice(-12).map((l, i) => <div key={i}>{l}</div>)}
+          </div>
+        </section>
       )}
     </div>
   )

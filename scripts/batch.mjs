@@ -1,22 +1,24 @@
 #!/usr/bin/env node
 /* ------------------------------------------------------------
- * OPED Finder - modo batch (termina os animes faltantes)
+ * OPED Finder - modo batch episódio-por-episodio
  *
  * 1. Lê o catálogo do painel Xtream (ggfiberpre.fun)
- * 2. Pula séries que já têm OP/ED em oped-data.ts (o seu ~30% feito)
- * 3. Para cada série faltante: compara o áudio de 2 episódios,
- *    descobre o intervalo do OP e do ED, e grava de volta no
- *    formato da sua base (oped-data.ts).
+ * 2. Compara com oped-data.ts e lista episódios faltando OP/ED
+ * 3. Para cada episódio faltante: compara áudio com outro ep da
+ *    mesma série, descobre OP/ED, grava de volta em oped-data.ts
+ * 4. Emite progresso em linha para o app exibir em tempo real
  *
  * Uso:
- *   npm run batch          # analisa só o que falta (modo interativo)
- *   npm run batch -- --dry # não grava, apenas mostra o que faria
+ *   npm run batch          # analisa tudo o que falta
+ *   npm run batch -- --dry # só mostra o que faria (não grava)
+ *   npm run batch -- --mal 21  # só uma série (MAL id)
  ------------------------------------------------------------ */
 import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
-import { analyzeFiles, runProbe, findOpWithRetries } from '../electron/analyzer.cjs'
 import { createRequire } from 'node:module'
+import { analyzeFiles, runProbe, findOpWithRetries } from '../electron/analyzer.cjs'
+
 const require = createRequire(import.meta.url)
 const FFMPEG = require('ffmpeg-static')
 
@@ -29,8 +31,10 @@ const OPED_FILE = path.join(ST, 'oped-data.ts')
 
 const dryRun = process.argv.includes('--dry')
 const verbose = process.argv.includes('--v')
+const malFiltro = process.argv.find((a) => a.startsWith('--mal='))?.split('=')[1]
 
 const log = (...a) => { if (verbose || dryRun) console.log(...a) }
+const progress = (text) => process.stdout.write(`PROGRESS:${text}\n`)
 
 const norm = (nome) => String(nome ?? '')
   .replace(/\[[^\]]*\]/g, ' ')
@@ -44,12 +48,7 @@ const norm = (nome) => String(nome ?? '')
   .trim()
   .toLowerCase()
 
-// ---------- carrega mapa MAL ----------
-const malTs = fs.readFileSync(path.join(ST, 'anime-mal-ids.ts'), 'utf8')
-const MAL = new Map()
-for (const m of malTs.matchAll(/^\s*"([^"]+)"\s*:\s*"(\d+)"/gm)) MAL.set(m[1], m[2])
-
-// ---------- carrega OPED existente ----------
+// ---------- carrega OPED ----------
 const OPED = new Map()
 {
   const lines = fs.readFileSync(OPED_FILE, 'utf8').split(/\r?\n/)
@@ -57,20 +56,33 @@ const OPED = new Map()
   for (const raw of lines) {
     const m1 = /^  '(\d+)': \{/.exec(raw)
     const m2 = /^    '([^']+)': \{/.exec(raw)
+    const m3 = /^      '(\d+)': \{ (.*) \},?$/.exec(raw)
     if (m1) { malId = m1[1]; if (!OPED.has(malId)) OPED.set(malId, new Map()); season = null; continue }
     if (m2 && malId) { season = m2[1]; if (!OPED.get(malId).has(season)) OPED.get(malId).set(season, new Map()); continue }
+    if (m3 && malId && season) {
+      const body = m3[2]
+      OPED.get(malId).get(season).set(m3[1], {
+        op: /op: \{ start: ([\d.]+), end: ([\d.]+) \}/.test(body),
+        ed: /ed: \{ start: ([\d.]+), end: ([\d.]+) \}/.test(body),
+      })
+    }
   }
 }
-console.log('Séries já com OP/ED na base:', OPED.size)
+console.log('Séries com dados OPED:', OPED.size)
 
-// ---------- API painel ----------
+// ---------- carrega MAL ----------
+const malTs = fs.readFileSync(path.join(ST, 'anime-mal-ids.ts'), 'utf8')
+const MAL = new Map()
+for (const m of malTs.matchAll(/^\s*"([^"]+)"\s*:\s*"(\d+)"/gm)) MAL.set(m[1], m[2])
+
+// ---------- API ----------
 async function api(action, extra = '') {
   const res = await fetch(`${B}/player_api.php?username=${U}&password=${P}&action=${action}${extra}`, { signal: AbortSignal.timeout(180000) })
   if (!res.ok) throw new Error(`${action} ${res.status}`)
   return res.json()
 }
 
-// ---------- extrai PCM de uma janela ----------
+// ---------- pcm ----------
 async function pcmWindow(fileUrl, start, dur) {
   const out = path.join(TMP, `batch_${Date.now()}_${Math.random().toString(36).slice(2)}.pcm`)
   execFileSync(FFMPEG, [
@@ -79,105 +91,83 @@ async function pcmWindow(fileUrl, start, dur) {
   ], { stdio: ['ignore', 'pipe', 'pipe'] })
   const buf = fs.readFileSync(out)
   fs.unlinkSync(out)
-  const samples = new Int16Array(buf.buffer, buf.byteOffset, Math.floor(buf.length / 2))
-  return samples
+  return new Int16Array(buf.buffer, buf.byteOffset, Math.floor(buf.length / 2))
 }
 
-// ---------- analisa uma série (2 episódios basta para achar OP/ED) ----------
-async function analisarSerie(info, mal) {
-  const epList = []
-  for (const [skey, list] of Object.entries(info.episodes || {})) {
-    for (const e of list) epList.push({ ...e, season: Number(e.season ?? skey) })
-  }
-  if (epList.length < 2) {
-    log(`${mal}: só ${epList.length} episódio, pulando (precisa de ≥2 para comparar)`)
-    return null
-  }
+// ---------- analisa um episódio ----------
+async function analisarEpisodio(info, mal, skey, e) {
+  const seasonNum = String(e.season ?? skey)
+  const epNum = Number(e.episode_num)
+  const file = `${B}/series/${U}/${P}/${e.id}.${e.container_extension}`
+  const probe = await runProbe(file).catch(() => ({ duration: 0 }))
+  if (!probe.duration) return { ok: false, motivo: 'sem duração' }
 
-  // ordena e pega os 2 primeiros episódios distintos
-  epList.sort((a, b) => Number(a.episode_num) - Number(b.episode_num))
-  const a = epList[0]
-  const b = epList[1]
+  // busca outro episódio da mesma série/temporada para comparar
+  const outro = info.episodes[skey]?.find((x) => x.id !== e.id)
+    ?? Object.values(info.episodes).flat().find((x) => x.id !== e.id)
+  if (!outro) return { ok: false, motivo: 'sem outro ep' }
 
-  log(`${mal}: comparando ep ${a.episode_num} (t${a.season}) vs ep ${b.episode_num} (t${b.season})`)
+  const outroFile = `${B}/series/${U}/${P}/${outro.id}.${outro.container_extension}`
+  const probeOutro = await runProbe(outroFile).catch(() => ({ duration: 0 }))
+  if (!probeOutro.duration) return { ok: false, motivo: 'outro sem duração' }
 
-  const probeA = await runProbe(`${B}/series/${U}/${P}/${a.id}.${a.container_extension}`).catch(() => ({ duration: 0 }))
-  const probeB = await runProbe(`${B}/series/${U}/${P}/${b.id}.${b.container_extension}`).catch(() => ({ duration: 0 }))
-  if (!probeA.duration || !probeB.duration) {
-    log(`${mal}: falha ao obter duração`)
-    return null
-  }
+  const dur = probe.duration
+  const opDur = Math.min(480, dur * 0.4)
+  const edStart = Math.max(dur - 480, dur * 0.6)
+  const edDur = dur - edStart
 
-  // janelas: OP no começo (0-480s), ED no fim (dur-480 até dur-8)
-  const opA = Math.min(480, probeA.duration * 0.4)
-  const opB = Math.min(480, probeB.duration * 0.4)
-  const edA = Math.max(probeA.duration - 480, probeA.duration * 0.6)
-  const edB = Math.max(probeB.duration - 480, probeB.duration * 0.6)
-
-  const files = [`${B}/series/${U}/${P}/${a.id}.${a.container_extension}`, `${B}/series/${U}/${P}/${b.id}.${b.container_extension}`]
-
-  // Analisa OP e ED juntos (regiões diferentes do mesmo áudio)
-  const result = await analyzeFiles(files, {
-    onProgress: (p) => log(`   ${p.phase} ${p.kind} ${p.index + 1}/${p.total}`),
+  const result = await analyzeFiles([file, outroFile], {
+    onProgress: (p) => log(`   ${mal} ep${epNum} ${p.phase} ${p.kind} ${p.index + 1}/${p.total}`),
   })
 
-  // monta resultado por episódio
-  const byFile = new Map(result.episodes.map((e) => [e.file, e]))
-  const saida = { mal, episodios: [], opSeries: result.opSeries, edSeries: result.edSeries }
+  const byFile = new Map(result.episodes.map((x) => [x.file, x]))
+  const found = byFile.get(file)
+  if (!found) return { ok: false, motivo: 'não encontrado na análise' }
 
-  for (const ep of epList) {
-    const f = `${B}/series/${U}/${P}/${ep.id}.${ep.container_extension}`
-    const found = byFile.get(f)
-    if (!found) continue
-
-    // Se o OP não foi detectado na primeira tentativa, tenta com janelas alternativas.
-    let opMark = found.op
-    if (!opMark) {
-      const outroFile = epList.find((e) => e.id !== ep.id)
-        ? `${B}/series/${U}/${P}/${epList.find((e) => e.id !== ep.id).id}.${epList.find((e) => e.id !== ep.id).container_extension}`
-        : null
-      if (outroFile) {
-        const retry = await findOpWithRetries(f, outroFile, (p) => log(`   retry ${p.kind} ${p.index + 1}/${p.total}`))
-        if (retry) opMark = { start: retry.start, end: retry.end, confidence: retry.confidence }
-      }
-    }
-
-    saida.episodios.push({
-      temporada: ep.season,
-      episodio: Number(ep.episode_num),
-      op: opMark ? { start: Math.round(opMark.start * 100) / 100, end: Math.round(opMark.end * 100) / 100, confidence: Math.round(opMark.confidence * 100) / 100 } : null,
-      ed: found.ed ? { start: Math.round(found.ed.start * 100) / 100, end: Math.round(found.ed.end * 100) / 100, confidence: Math.round(found.ed.confidence * 100) / 100 } : null,
-      len: probeA.duration,
-    })
+  let opMark = found.op
+  if (!opMark) {
+    const retry = await findOpWithRetries(file, outroFile, (p) => log(`   ${mal} ep${epNum} retry ${p.kind}`))
+    if (retry) opMark = { start: retry.start, end: retry.end, confidence: retry.confidence }
   }
-  return saida
+
+  return {
+    ok: true,
+    temporada: seasonNum,
+    episodio: epNum,
+    op: opMark ? { start: Math.round(opMark.start * 100) / 100, end: Math.round(opMark.end * 100) / 100, confidence: Math.round(opMark.confidence * 100) / 100 } : null,
+    ed: found.ed ? { start: Math.round(found.ed.start * 100) / 100, end: Math.round(found.ed.end * 100) / 100, confidence: Math.round(found.ed.confidence * 100) / 100 } : null,
+    len: Math.round(dur * 100) / 100,
+  }
 }
 
-// ---------- grava de volta no oped-data.ts ----------
+// ---------- grava de volta ----------
 function gravarOPED(novos) {
   let conteudo = fs.readFileSync(OPED_FILE, 'utf8')
 
-  // Remove entradas existentes dos MALs que vamos regravar (evita duplicatas)
-  for (const { mal } of novos) {
+  // remove entradas dos MALs que vamos regravar
+  const mals = [...new Set(novos.map((n) => n.mal))]
+  for (const mal of mals) {
     const regex = new RegExp(`(?ms)  '${mal}': \\{[\\s\\S]*?\\n  \\},?\\n?`)
     conteudo = conteudo.replace(regex, '')
   }
 
-  for (const { mal, episodios } of novos) {
-    if (!episodios.length) continue
-    const tempMap = new Map()
-    for (const ep of episodios) {
-      if (!tempMap.has(ep.temporada)) tempMap.set(ep.temporada, {})
-      tempMap.get(ep.temporada)[ep.episodio] = ep
-    }
+  // agrupa novos por mal -> temporada -> episodio
+  const grupos = new Map()
+  for (const n of novos) {
+    if (!grupos.has(n.mal)) grupos.set(n.mal, new Map())
+    const tempMap = grupos.get(n.mal)
+    if (!tempMap.has(n.temporada)) tempMap.set(n.temporada, {})
+    tempMap.get(n.temporada)[n.episodio] = n
+  }
 
+  for (const [mal, tempMap] of grupos) {
     let bloco = `\n  '${mal}': {\n`
     for (const [temp, eps] of tempMap) {
       bloco += `    '${temp}': {\n`
       for (const [num, mark] of Object.entries(eps)) {
         const op = mark.op ? `op: { start: ${mark.op.start}, end: ${mark.op.end } }, ` : ''
         const ed = mark.ed ? `ed: { start: ${mark.ed.start}, end: ${mark.ed.end } }, ` : ''
-        const len = mark.len ? `len: ${Math.round(mark.len * 100) / 100}` : ''
+        const len = mark.len ? `len: ${mark.len}` : ''
         bloco += `      '${num}': { ${op}${ed}${len} },\n`
       }
       bloco += '    },\n'
@@ -189,7 +179,7 @@ function gravarOPED(novos) {
   }
 
   fs.writeFileSync(OPED_FILE, conteudo, 'utf8')
-  console.log(`Gravado ${novos.length} série(s) em ${OPED_FILE}`)
+  console.log(`Gravado ${novos.length} episódio(s) de ${mal.length} série(s) em ${OPED_FILE}`)
 }
 
 // ---------- main ----------
@@ -197,32 +187,74 @@ async function main() {
   const all = await api('get_series')
   console.log('Séries no painel:', all.length)
 
-  const faltantes = []
+  const matched = []
   for (const s of all) {
     const key = norm(s.name)
     const mal = MAL.get(key)
     if (!mal) continue
-    if (OPED.has(mal)) continue
-    faltantes.push({ ...s, mal, key })
+    if (malFiltro && mal !== malFiltro) continue
+    matched.push({ ...s, mal, key })
   }
-  console.log('Séries animes sem OP/ED ainda:', faltantes.length)
-  for (const s of faltantes) console.log('  -', s.mal.padStart(6), '|', s.name)
+  console.log('Animes com MAL:', matched.length)
 
-  if (dryRun) return
-
-  const novos = []
-  for (const s of faltantes) {
+  // monta lista de episódios faltando
+  const fila = []
+  for (const s of matched) {
     try {
       const info = await api('get_series_info', `&series_id=${s.series_id}`)
-      const saida = await analisarSerie(info, s.mal)
-      if (saida) novos.push(saida)
-    } catch (e) {
-      console.log('ERRO', s.name, e.message)
+      const seasons = OPED.get(s.mal)
+      for (const [skey, list] of Object.entries(info.episodes || {})) {
+        for (const e of list) {
+          const seasonNum = String(e.season ?? skey)
+          let bucket = seasons?.get(seasonNum)
+          if (!bucket && seasons?.has('*')) bucket = seasons.get('*')
+          const mark = bucket?.get(String(e.episode_num))
+          const temOp = mark?.op, temEd = mark?.ed
+          if (!temOp || !temEd) {
+            fila.push({ ...s, info, skey, e, temOp, temEd })
+          }
+        }
+      }
+    } catch (err) {
+      console.log('erro info', s.name, err.message)
     }
   }
 
-  if (novos.length) await gravarOPED(novos)
-  console.log('\nConcluído. Novas séries gravadas:', novos.length)
+  console.log('Episódios faltando OP ou ED:', fila.length)
+  if (dryRun) {
+    for (const item of fila.slice(0, 50)) {
+      console.log(`  ${item.mal} | ${item.nome} | temp ${item.skey} | ep ${item.e.episode_num} | OP ${item.temOp ? 'ok' : 'FALTA'} | ED ${item.temEd ? 'ok' : 'FALTA'}`)
+    }
+    if (fila.length > 50) console.log(`  ... e mais ${fila.length - 50}`)
+    return
+  }
+
+  // processa
+  const novos = []
+  let processados = 0
+  for (const item of fila) {
+    processados++
+    progress(`${processados}/${fila.length}`)
+    try {
+      const r = await analisarEpisodio(item.info, item.mal, item.skey, item.e)
+      if (r.ok) {
+        novos.push({ mal: item.mal, ...r })
+        log(`  ✓ ${item.nome} temp${r.temporada} ep${r.episodio} OP=${!!r.op} ED=${!!r.ed}`)
+      } else {
+        log(`  ✗ ${item.nome} temp${item.skey} ep${item.e.episode_num}: ${r.motivo}`)
+      }
+    } catch (err) {
+      log(`  ✗ ${item.nome} temp${item.skey} ep${item.e.episode_num}: ${err.message}`)
+    }
+
+    // grava a cada 10 episódios para não perder progresso
+    if (novos.length >= 10) {
+      gravarOPED(novos.splice(0, novos.length))
+    }
+  }
+  if (novos.length) gravarOPED(novos)
+
+  console.log('\nConcluído. Processados:', processados, '| Novos marcados:', fila.length)
 }
 
 main().catch((e) => { console.error('FALHA:', e.message); process.exit(1) })
