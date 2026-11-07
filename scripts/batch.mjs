@@ -1,21 +1,19 @@
 #!/usr/bin/env node
 /* ------------------------------------------------------------
- * OPED Finder - modo batch episódio-por-episodio
+ * OPED Finder - modo batch episódio-por-episodio (PARALELO)
  *
  * 1. Lê o catálogo do painel Xtream (ggfiberpre.fun)
  * 2. Compara com oped-data.ts e lista episódios faltando OP/ED
- * 3. Para cada episódio faltante: compara áudio com outro ep da
- *    mesma série, descobre OP/ED, grava de volta em oped-data.ts
- * 4. Emite progresso em linha para o app exibir em tempo real
+ * 3. Processa episódios em paralelo (lote de 3) para acelerar
+ * 4. Grava de volta em oped-data.ts a cada 10 episódios
  *
  * Uso:
- *   npm run batch          # analisa tudo o que falta
- *   npm run batch -- --dry # só mostra o que faria (não grava)
- *   npm run batch -- --mal 21  # só uma série (MAL id)
+ *   npm run batch                  # processa tudo o que falta
+ *   npm run batch -- --mal=37885   # só uma série
+ *   npm run batch -- --dry         # não grava, apenas mostra
  ------------------------------------------------------------ */
 import fs from 'node:fs'
 import path from 'node:path'
-import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { analyzeFiles, runProbe, findOpWithRetries } from '../electron/analyzer.cjs'
 
@@ -32,6 +30,7 @@ const OPED_FILE = path.join(ST, 'oped-data.ts')
 const dryRun = process.argv.includes('--dry')
 const verbose = process.argv.includes('--v')
 const malFiltro = process.argv.find((a) => a.startsWith('--mal='))?.split('=')[1]
+const PARALELO = 3 // episódios processados simultâneos
 
 const log = (...a) => { if (verbose || dryRun) console.log(...a) }
 const progress = (text) => process.stdout.write(`PROGRESS:${text}\n`)
@@ -80,18 +79,6 @@ async function api(action, extra = '') {
   const res = await fetch(`${B}/player_api.php?username=${U}&password=${P}&action=${action}${extra}`, { signal: AbortSignal.timeout(180000) })
   if (!res.ok) throw new Error(`${action} ${res.status}`)
   return res.json()
-}
-
-// ---------- pcm ----------
-async function pcmWindow(fileUrl, start, dur) {
-  const out = path.join(TMP, `batch_${Date.now()}_${Math.random().toString(36).slice(2)}.pcm`)
-  execFileSync(FFMPEG, [
-    '-v', 'error', '-ss', String(start), '-t', String(dur),
-    '-i', fileUrl, '-vn', '-ac', '1', '-ar', '11025', '-f', 's16le', out
-  ], { stdio: ['ignore', 'pipe', 'pipe'] })
-  const buf = fs.readFileSync(out)
-  fs.unlinkSync(out)
-  return new Int16Array(buf.buffer, buf.byteOffset, Math.floor(buf.length / 2))
 }
 
 // ---------- analisa um episódio ----------
@@ -145,7 +132,6 @@ function gravarOPED(novos) {
   let conteudo = fs.readFileSync(OPED_FILE, 'utf8')
   const linhas = conteudo.split(/\r?\n/)
 
-  // remove entradas dos MALs que vamos regravar (parse linha a linha, sem regex)
   const mals = [...new Set(novos.map((n) => n.mal))]
   const manter = []
   let skip = false
@@ -160,7 +146,6 @@ function gravarOPED(novos) {
       continue
     }
     if (skip) {
-      // conta chaves para saber quando o bloco do MAL terminou
       for (const c of linha) { if (c === '{') nivel++; if (c === '}') nivel-- }
       if (nivel <= 0) skip = false
       continue
@@ -169,7 +154,6 @@ function gravarOPED(novos) {
   }
   conteudo = manter.join('\n')
 
-  // agrupa novos por mal -> temporada -> episodio
   const grupos = new Map()
   for (const n of novos) {
     if (!grupos.has(n.mal)) grupos.set(n.mal, new Map())
@@ -200,6 +184,26 @@ function gravarOPED(novos) {
   console.log(`Gravado ${novos.length} episódio(s) de ${mals.length} série(s) em ${OPED_FILE}`)
 }
 
+// ---------- processa um lote em paralelo ----------
+async function processarLote(lote) {
+  const resultados = await Promise.all(lote.map(async (item) => {
+    try {
+      const r = await analisarEpisodio(item.info, item.mal, item.skey, item.e)
+      if (r.ok) {
+        log(`  ✓ ${item.nome} temp${r.temporada} ep${r.episodio} OP=${!!r.op} ED=${!!r.ed}`)
+        return { mal: item.mal, ...r, sucesso: true }
+      } else {
+        log(`  ✗ ${item.nome} temp${item.skey} ep${item.e.episode_num}: ${r.motivo}`)
+        return { sucesso: false, motivo: r.motivo }
+      }
+    } catch (err) {
+      log(`  ✗ ${item.nome} temp${item.skey} ep${item.e.episode_num}: ${err.message}`)
+      return { sucesso: false, motivo: err.message }
+    }
+  }))
+  return resultados
+}
+
 // ---------- main ----------
 async function main() {
   const all = await api('get_series')
@@ -215,7 +219,6 @@ async function main() {
   }
   console.log('Animes com MAL:', matched.length)
 
-  // monta lista de episódios faltando
   const fila = []
   for (const s of matched) {
     try {
@@ -247,26 +250,21 @@ async function main() {
     return
   }
 
-  // processa
+  // processa em lotes paralelos
   const novos = []
   let processados = 0
-  for (const item of fila) {
-    processados++
+  for (let i = 0; i < fila.length; i += PARALELO) {
+    const lote = fila.slice(i, i + PARALELO)
+    const resultados = await processarLote(lote)
+    processados += lote.length
     progress(`${processados}/${fila.length}`)
-    try {
-      const r = await analisarEpisodio(item.info, item.mal, item.skey, item.e)
-      if (r.ok) {
-        novos.push({ mal: item.mal, ...r })
-        log(`  ✓ ${item.nome} temp${r.temporada} ep${r.episodio} OP=${!!r.op} ED=${!!r.ed}`)
-      } else {
-        log(`  ✗ ${item.nome} temp${item.skey} ep${item.e.episode_num}: ${r.motivo}`)
-      }
-    } catch (err) {
-      log(`  ✗ ${item.nome} temp${item.skey} ep${item.e.episode_num}: ${err.message}`)
+
+    for (const r of resultados) {
+      if (r.sucesso) novos.push(r)
     }
 
-    // grava a cada 10 episódios para não perder progresso
-    if (novos.length >= 10) {
+    // grava a cada 10 episódios processados
+    if (processados % 10 === 0 && novos.length > 0) {
       gravarOPED(novos.splice(0, novos.length))
     }
   }
