@@ -2,9 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 interface Props {
   onClose: () => void
+  onBackdropClick?: () => void
 }
 
-export default function BatchPanel({ onClose }: Props) {
+export default function BatchPanel({ onClose, onBackdropClick }: Props) {
   const [logs, setLogs] = useState<string[]>([])
   const [running, setRunning] = useState(false)
   const [result, setResult] = useState<{ ok: boolean; log: string } | null>(null)
@@ -46,11 +47,13 @@ export default function BatchPanel({ onClose }: Props) {
   }
 
   return (
-    <section className="batch-panel">
-      <div className="batch-header">
-        <h2>Modo Batch — Catálogo do Painel</h2>
-        <button onClick={onClose}>Fechar</button>
-      </div>
+    <section className="batch-panel" onClick={onBackdropClick ? (e) => { if (e.target === e.currentTarget) onBackdropClick() } : undefined}>
+      <div className="batch-backdrop" onClick={onBackdropClick ? (e) => { if (e.target === e.currentTarget) onBackdropClick() } : undefined} />
+      <div className="batch-content" onClick={(e) => e.stopPropagation()}>
+        <div className="batch-header">
+          <h2>Modo Batch — Catálogo do Painel</h2>
+          <button onClick={onClose}>Fechar</button>
+        </div>
 
       <div className="batch-body">
         <div className="batch-actions">
@@ -71,6 +74,7 @@ export default function BatchPanel({ onClose }: Props) {
             {result.ok ? '✓ Concluído.' : '✗ Falhou.'} {result.log ? ` — ${result.log}` : ''}
           </div>
         )}
+      </div>
       </div>
     </section>
   )

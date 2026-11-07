@@ -261,6 +261,28 @@ button.ghost { background: transparent; color: var(--muted); }
   color: var(--text);
 }
 
+.batch-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
+.batch-content {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  max-width: 700px;
+  height: 100%;
+  max-height: 100vh;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  margin: 20px auto;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.45);
+}
+
 .batch-header {
   display: flex;
   align-items: center;
@@ -306,6 +328,28 @@ button.ghost { background: transparent; color: var(--muted); }
   display: flex;
   flex-direction: column;
   color: var(--text);
+}
+
+.history-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
+.history-content {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  max-width: 700px;
+  height: 100%;
+  max-height: 100vh;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  margin: 20px auto;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.45);
 }
 
 .history-header {

@@ -362,11 +362,18 @@ export default function App() {
       {toast && <div className={`toast ${toast.type}`}>{toast.text}</div>}
 
       {batchOpen && (
-        <BatchPanel onClose={() => setBatchOpen(false)} />
+        <BatchPanel
+          onClose={() => setBatchOpen(false)}
+          onBackdropClick={() => setBatchOpen(false)}
+        />
       )}
 
       {historyOpen && (
-        <HistoryPanel library={library} onClose={() => setHistoryOpen(false)} />
+        <HistoryPanel
+          library={library}
+          onClose={() => setHistoryOpen(false)}
+          onBackdropClick={() => setHistoryOpen(false)}
+        />
       )}
 
       {batchProgress && batchVisible && (

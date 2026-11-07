@@ -143,13 +143,31 @@ async function analisarEpisodio(info, mal, skey, e) {
 // ---------- grava de volta ----------
 function gravarOPED(novos) {
   let conteudo = fs.readFileSync(OPED_FILE, 'utf8')
+  const linhas = conteudo.split(/\r?\n/)
 
-  // remove entradas dos MALs que vamos regravar
+  // remove entradas dos MALs que vamos regravar (parse linha a linha, sem regex)
   const mals = [...new Set(novos.map((n) => n.mal))]
-  for (const mal of mals) {
-    const regex = new RegExp(`(?ms)  '${mal}': \\{[\\s\\S]*?\\n  \\},?\\n?`)
-    conteudo = conteudo.replace(regex, '')
+  const manter = []
+  let skip = false
+  let nivel = 0
+  for (const linha of linhas) {
+    const ehMal = /^  '(\d+)': \{/.test(linha)
+    if (ehMal) {
+      const m = /^  '(\d+)': \{/.exec(linha)
+      skip = mals.includes(m[1])
+      nivel = 0
+      if (!skip) manter.push(linha)
+      continue
+    }
+    if (skip) {
+      // conta chaves para saber quando o bloco do MAL terminou
+      for (const c of linha) { if (c === '{') nivel++; if (c === '}') nivel-- }
+      if (nivel <= 0) skip = false
+      continue
+    }
+    manter.push(linha)
   }
+  conteudo = manter.join('\n')
 
   // agrupa novos por mal -> temporada -> episodio
   const grupos = new Map()
@@ -179,7 +197,7 @@ function gravarOPED(novos) {
   }
 
   fs.writeFileSync(OPED_FILE, conteudo, 'utf8')
-  console.log(`Gravado ${novos.length} episódio(s) de ${mal.length} série(s) em ${OPED_FILE}`)
+  console.log(`Gravado ${novos.length} episódio(s) de ${mals.length} série(s) em ${OPED_FILE}`)
 }
 
 // ---------- main ----------

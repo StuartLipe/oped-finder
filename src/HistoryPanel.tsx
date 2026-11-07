@@ -4,9 +4,10 @@ import type { Episode, Library } from './types'
 interface Props {
   library: Library
   onClose: () => void
+  onBackdropClick?: () => void
 }
 
-export default function HistoryPanel({ library, onClose }: Props) {
+export default function HistoryPanel({ library, onClose, onBackdropClick }: Props) {
   const [search, setSearch] = useState('')
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
 
@@ -50,11 +51,13 @@ export default function HistoryPanel({ library, onClose }: Props) {
   }
 
   return (
-    <section className="history-panel">
-      <div className="history-header">
-        <h2>Histórico — OP/ED já feitos</h2>
-        <button onClick={onClose}>Fechar</button>
-      </div>
+    <section className="history-panel" onClick={onBackdropClick ? (e) => { if (e.target === e.currentTarget) onBackdropClick() } : undefined}>
+      <div className="history-backdrop" onClick={onBackdropClick ? (e) => { if (e.target === e.currentTarget) onBackdropClick() } : undefined} />
+      <div className="history-content" onClick={(e) => e.stopPropagation()}>
+        <div className="history-header">
+          <h2>Histórico — OP/ED já feitos</h2>
+          <button onClick={onClose}>Fechar</button>
+        </div>
 
       <div className="history-body">
         <div className="history-summary">
@@ -121,6 +124,7 @@ export default function HistoryPanel({ library, onClose }: Props) {
             <div className="history-empty">Nenhum anime encontrado.</div>
           )}
         </ul>
+      </div>
       </div>
     </section>
   )
